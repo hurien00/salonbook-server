@@ -17,6 +17,8 @@ const allowedOrigins = [
   process.env.CLIENT_URL || 'http://localhost:3000',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'http://localhost:3004',
+  'http://127.0.0.1:3004',
 ];
 
 app.use(
@@ -43,14 +45,12 @@ app.use(
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Ensure uploads directory exists and serve statically
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 app.use('/uploads', express.static(uploadDir));
 
-// Multer setup for Service Image uploads
 const storage = multer.diskStorage({
   destination(_req, _file, cb) {
     cb(null, uploadDir);
@@ -78,7 +78,16 @@ const upload = multer({
   },
 });
 
-// Helper to safely delete local uploaded file when replacing or deleting a service
+function isValidHttpUrl(value) {
+  if (!value || typeof value !== 'string') return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function removeLocalUploadIfExists(imageUrl) {
   if (!imageUrl || typeof imageUrl !== 'string') return;
   const marker = '/uploads/';
@@ -118,57 +127,61 @@ let servicesCollection;
 let appointmentsCollection;
 let transactionsCollection;
 
-// Verify admin role from DB user record, session/user object, or header
-async function requireAdmin(req, res, next) {
-  try {
-    const headerRole = req.headers['x-user-role']
-      ? String(req.headers['x-user-role']).toLowerCase()
-      : null;
-    const userId = req.headers['x-user-id'] ? String(req.headers['x-user-id']).trim() : null;
-    const userEmail = req.headers['x-user-email']
-      ? String(req.headers['x-user-email']).trim().toLowerCase()
-      : null;
+async function resolveRequestUser(req) {
+  const userId = req.headers['x-user-id'] ? String(req.headers['x-user-id']).trim() : null;
+  const userEmail = req.headers['x-user-email']
+    ? String(req.headers['x-user-email']).trim().toLowerCase()
+    : null;
+  const headerRole = req.headers['x-user-role']
+    ? String(req.headers['x-user-role']).trim().toLowerCase()
+    : null;
 
-    if (usersCollection && (userId || userEmail)) {
-      const orConditions = [];
-      if (userId) {
-        if (ObjectId.isValid(userId)) {
-          orConditions.push({ _id: new ObjectId(userId) });
-        }
-        orConditions.push({ id: userId });
-      }
-      if (userEmail) {
-        orConditions.push({ email: userEmail });
-      }
+  if (usersCollection && (userId || userEmail)) {
+    const orConditions = [];
+    if (userId) {
+      if (ObjectId.isValid(userId)) orConditions.push({ _id: new ObjectId(userId) });
+      orConditions.push({ id: userId });
+    }
+    if (userEmail) orConditions.push({ email: userEmail });
 
-      if (orConditions.length > 0) {
-        const dbUserDoc = await usersCollection.findOne({ $or: orConditions });
-        if (dbUserDoc && String(dbUserDoc.role).toLowerCase() === 'admin') {
-          req.user = dbUserDoc;
-          return next();
-        }
+    if (orConditions.length > 0) {
+      const dbUserDoc = await usersCollection.findOne({ $or: orConditions });
+      if (dbUserDoc) {
+        return { ...dbUserDoc, role: dbUserDoc.role || headerRole || 'customer' };
       }
     }
+  }
 
-    const sessionRole = req.user?.role || req.session?.user?.role;
-    if (sessionRole && String(sessionRole).toLowerCase() === 'admin') {
+  if (req.user) return req.user;
+  if ((userId || userEmail) && headerRole) {
+    return { _id: userId || userEmail, email: userEmail || '', role: headerRole };
+  }
+
+  return null;
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    const currentUser = await resolveRequestUser(req);
+    if (currentUser && String(currentUser.role || '').toLowerCase() === 'admin') {
+      req.user = currentUser;
       return next();
     }
 
+    const headerRole = req.headers['x-user-role']
+      ? String(req.headers['x-user-role']).toLowerCase()
+      : null;
     if (headerRole === 'admin' && process.env.NODE_ENV !== 'production') {
       return next();
     }
 
     return res.status(403).json({
       success: false,
-      message: 'Forbidden: Only Admin can create, update, or delete services',
+      message: 'Forbidden: Only Admin can perform this action',
     });
   } catch (error) {
     console.error('Admin verification error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to verify admin role',
-    });
+    return res.status(500).json({ success: false, message: 'Failed to verify admin role' });
   }
 }
 
@@ -203,6 +216,55 @@ async function startServer() {
       }
     });
 
+    // Update logged-in user/admin profile
+    app.put('/auth/profile', async (req, res) => {
+      try {
+        const currentUser = await resolveRequestUser(req);
+        if (!currentUser) {
+          return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const { name, phone, image } = req.body;
+        if (!name || !String(name).trim()) {
+          return res.status(400).json({ success: false, message: 'Name cannot be empty' });
+        }
+
+        const updateFields = {
+          name: String(name).trim(),
+          phone: phone !== undefined ? String(phone).trim() : currentUser.phone || '',
+          updatedAt: new Date(),
+        };
+
+        if (image !== undefined && String(image).trim()) {
+          if (!isValidHttpUrl(image)) {
+            return res.status(400).json({ success: false, message: 'Invalid image URL' });
+          }
+          updateFields.image = String(image).trim();
+        }
+
+        const filter =
+          currentUser._id && ObjectId.isValid(String(currentUser._id))
+            ? { _id: new ObjectId(String(currentUser._id)) }
+            : { email: String(currentUser.email).toLowerCase() };
+
+        const updatedDoc = await usersCollection.findOneAndUpdate(
+          filter,
+          { $set: updateFields },
+          { returnDocument: 'after' },
+        );
+
+        const resultDoc = updatedDoc?.value || updatedDoc || { ...currentUser, ...updateFields };
+        return res.json({
+          success: true,
+          message: 'Profile updated successfully',
+          data: resultDoc,
+        });
+      } catch (error) {
+        console.error('Error updating profile:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update profile' });
+      }
+    });
+
     // Admin overview KPI stats
     app.get('/appointments/stats/admin', async (_req, res) => {
       try {
@@ -217,8 +279,8 @@ async function startServer() {
           usersCollection.countDocuments({ role: { $ne: 'admin' } }),
           servicesCollection.countDocuments({ status: 'active' }),
           appointmentsCollection.countDocuments({}),
-          appointmentsCollection.countDocuments({ status: 'pending' }),
-          appointmentsCollection.countDocuments({ status: 'confirmed' }),
+          appointmentsCollection.countDocuments({ status: { $in: ['Pending', 'pending'] } }),
+          appointmentsCollection.countDocuments({ status: { $in: ['Confirmed', 'confirmed'] } }),
           transactionsCollection.find({ status: 'succeeded' }).toArray(),
         ]);
 
@@ -246,20 +308,14 @@ async function startServer() {
       }
     });
 
-    // Get all services (supports search, category, sort, includeInactive)
+    // Get all services
     app.get('/services', async (req, res) => {
       try {
         const { search, category, sort, includeInactive } = req.query;
         const query = {};
 
-        if (includeInactive !== 'true') {
-          query.status = 'active';
-        }
-
-        if (category && category !== 'All') {
-          query.category = String(category);
-        }
-
+        if (includeInactive !== 'true') query.status = 'active';
+        if (category && category !== 'All') query.category = String(category);
         if (search && String(search).trim()) {
           query.serviceName = { $regex: String(search).trim(), $options: 'i' };
         }
@@ -296,10 +352,10 @@ async function startServer() {
       }
     });
 
-    // Create service (Admin only + FormData image upload + positive number validation)
+    // Create service (Admin only)
     app.post('/services', requireAdmin, upload.single('image'), async (req, res) => {
       try {
-        const { serviceName, category, description, price, duration, status } = req.body;
+        const { serviceName, category, description, price, duration, status, image } = req.body;
         const numericPrice = Number(price);
         const numericDuration = Number(duration);
 
@@ -307,30 +363,26 @@ async function startServer() {
           return res.status(400).json({ success: false, message: 'Service Name is required' });
         }
         if (!category || !String(category).trim()) {
-          return res
-            .status(400)
-            .json({ success: false, message: 'Service Category is required' });
+          return res.status(400).json({ success: false, message: 'Service Category is required' });
         }
         if (!description || !String(description).trim()) {
           return res.status(400).json({ success: false, message: 'Description is required' });
         }
         if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
-          return res
-            .status(400)
-            .json({ success: false, message: 'Price must be a positive number' });
+          return res.status(400).json({ success: false, message: 'Price must be a positive number' });
         }
         if (!Number.isFinite(numericDuration) || numericDuration <= 0) {
-          return res
-            .status(400)
-            .json({ success: false, message: 'Duration must be a positive number' });
-        }
-        if (!req.file) {
-          return res.status(400).json({ success: false, message: 'Service image is required' });
+          return res.status(400).json({ success: false, message: 'Duration must be a positive number' });
         }
 
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
-        const imageUrl = `${baseUrl}/uploads/${req.file.filename}`;
-        const normalizedStatus = status === 'inactive' ? 'inactive' : 'active';
+        let finalImageUrl = '';
+        if (req.file) {
+          finalImageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+        } else if (isValidHttpUrl(image)) {
+          finalImageUrl = String(image).trim();
+        } else {
+          return res.status(400).json({ success: false, message: 'Valid service image URL or file is required' });
+        }
 
         const newService = {
           serviceName: String(serviceName).trim(),
@@ -338,32 +390,331 @@ async function startServer() {
           description: String(description).trim(),
           price: numericPrice,
           duration: numericDuration,
-          image: imageUrl,
-          status: normalizedStatus,
+          image: finalImageUrl,
+          status: status === 'inactive' ? 'inactive' : 'active',
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
         const insertResult = await servicesCollection.insertOne(newService);
-        const createdService = { _id: insertResult.insertedId, ...newService };
-
-        res.status(201).json({ success: true, data: createdService });
+        res.status(201).json({ success: true, data: { _id: insertResult.insertedId, ...newService } });
       } catch (error) {
         console.error('Error creating service:', error);
         res.status(500).json({ success: false, message: 'Failed to create service' });
       }
     });
 
-   
+    // Update service (Admin only)
+    app.patch('/services/:id', requireAdmin, upload.single('image'), async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid service ID' });
+        }
+
+        const existingService = await servicesCollection.findOne({ _id: new ObjectId(id) });
+        if (!existingService) {
+          return res.status(404).json({ success: false, message: 'Service not found' });
+        }
+
+        const { serviceName, category, description, price, duration, status, image } = req.body;
+        const updateFields = { updatedAt: new Date() };
+
+        if (serviceName !== undefined) {
+          if (!String(serviceName).trim()) {
+            return res.status(400).json({ success: false, message: 'Service Name cannot be empty' });
+          }
+          updateFields.serviceName = String(serviceName).trim();
+        }
+        if (category !== undefined) {
+          if (!String(category).trim()) {
+            return res.status(400).json({ success: false, message: 'Service Category cannot be empty' });
+          }
+          updateFields.category = String(category).trim();
+        }
+        if (description !== undefined) {
+          if (!String(description).trim()) {
+            return res.status(400).json({ success: false, message: 'Description cannot be empty' });
+          }
+          updateFields.description = String(description).trim();
+        }
+        if (price !== undefined) {
+          const numericPrice = Number(price);
+          if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+            return res.status(400).json({ success: false, message: 'Price must be a positive number' });
+          }
+          updateFields.price = numericPrice;
+        }
+        if (duration !== undefined) {
+          const numericDuration = Number(duration);
+          if (!Number.isFinite(numericDuration) || numericDuration <= 0) {
+            return res.status(400).json({ success: false, message: 'Duration must be a positive number' });
+          }
+          updateFields.duration = numericDuration;
+        }
+        if (status !== undefined) {
+          updateFields.status = status === 'inactive' ? 'inactive' : 'active';
+        }
+        if (req.file) {
+          updateFields.image = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+          removeLocalUploadIfExists(existingService.image);
+        } else if (image !== undefined) {
+          if (!isValidHttpUrl(image)) {
+            return res.status(400).json({ success: false, message: 'Invalid service image URL' });
+          }
+          updateFields.image = String(image).trim();
+          removeLocalUploadIfExists(existingService.image);
+        }
+
+        const updatedDoc = await servicesCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          { $set: updateFields },
+          { returnDocument: 'after' },
+        );
+
+        res.json({ success: true, data: updatedDoc?.value || updatedDoc });
+      } catch (error) {
+        console.error('Error updating service:', error);
+        res.status(500).json({ success: false, message: 'Failed to update service' });
+      }
+    });
+
+    // Delete service (Admin only)
+    app.delete('/services/:id', requireAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid service ID' });
+        }
+
+        const existingService = await servicesCollection.findOne({ _id: new ObjectId(id) });
+        if (!existingService) {
+          return res.status(404).json({ success: false, message: 'Service not found' });
+        }
+
+        await servicesCollection.deleteOne({ _id: new ObjectId(id) });
+        removeLocalUploadIfExists(existingService.image);
+        res.json({ success: true, message: 'Service deleted successfully' });
+      } catch (error) {
+        console.error('Error deleting service:', error);
+        res.status(500).json({ success: false, message: 'Failed to delete service' });
+      }
+    });
+
+    // Create appointment request (Authenticated Customers only)
+    app.post('/appointments', async (req, res) => {
+      try {
+        const currentUser = await resolveRequestUser(req);
+        if (!currentUser) {
+          return res.status(401).json({
+            success: false,
+            message: 'Unauthorized: Please sign in as a customer to book an appointment',
+          });
+        }
+
+        if (String(currentUser.role || 'customer').toLowerCase() === 'admin') {
+          return res.status(403).json({
+            success: false,
+            message: 'Forbidden: Only customers can submit appointment requests',
+          });
+        }
+
+        const { serviceId, appointmentDate, timeSlot, message } = req.body;
+        if (!serviceId || !ObjectId.isValid(String(serviceId))) {
+          return res.status(400).json({ success: false, message: 'Valid service ID is required' });
+        }
+        if (!appointmentDate || !String(appointmentDate).trim()) {
+          return res.status(400).json({ success: false, message: 'Appointment date is required' });
+        }
+        if (!timeSlot || !String(timeSlot).trim()) {
+          return res.status(400).json({ success: false, message: 'Available time slot is required' });
+        }
+
+        const serviceObjId = new ObjectId(String(serviceId));
+        const service = await servicesCollection.findOne({ _id: serviceObjId });
+        if (!service) {
+          return res.status(404).json({ success: false, message: 'Service not found' });
+        }
+
+        if (String(service.status).toLowerCase() !== 'active') {
+          return res.status(400).json({
+            success: false,
+            message: 'This service is currently inactive and cannot be booked',
+          });
+        }
+
+        const cleanDate = String(appointmentDate).trim();
+        const cleanSlot = String(timeSlot).trim();
+
+        const duplicateActive = await appointmentsCollection.findOne({
+          serviceId: { $in: [serviceObjId, String(service._id)] },
+          appointmentDate: cleanDate,
+          timeSlot: cleanSlot,
+          status: { $in: ['Pending', 'Confirmed', 'pending', 'confirmed'] },
+        });
+
+        if (duplicateActive) {
+          return res.status(409).json({
+            success: false,
+            message: 'This date and time slot is already booked for this service',
+          });
+        }
+
+        const customerIdValue =
+          currentUser._id && ObjectId.isValid(String(currentUser._id))
+            ? new ObjectId(String(currentUser._id))
+            : String(currentUser._id || currentUser.id || '');
+
+        const newAppointment = {
+          serviceId: serviceObjId,
+          serviceName: service.serviceName,
+          customerId: customerIdValue,
+          customerEmail: String(currentUser.email || '').toLowerCase(),
+          appointmentDate: cleanDate,
+          timeSlot: cleanSlot,
+          message: message ? String(message).trim() : '',
+          servicePrice: Number(service.price || 0),
+          paymentStatus: 'Unpaid',
+          status: 'Pending',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const insertResult = await appointmentsCollection.insertOne(newAppointment);
+        return res.status(201).json({
+          success: true,
+          message: 'Appointment request submitted successfully!',
+          data: { _id: insertResult.insertedId, ...newAppointment },
+        });
+      } catch (error) {
+        console.error('Error creating appointment:', error);
+        return res.status(500).json({ success: false, message: 'Failed to submit appointment request' });
+      }
+    });
+
+    // Get appointments (Admin: all; Customer: own)
+    app.get('/appointments', async (req, res) => {
+      try {
+        const currentUser = await resolveRequestUser(req);
+        if (!currentUser) {
+          return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const role = String(currentUser.role || 'customer').toLowerCase();
+        const query = {};
+
+        if (role !== 'admin') {
+          const orConditions = [];
+          if (currentUser._id) {
+            orConditions.push({ customerId: String(currentUser._id) });
+            if (ObjectId.isValid(String(currentUser._id))) {
+              orConditions.push({ customerId: new ObjectId(String(currentUser._id)) });
+            }
+          }
+          if (currentUser.email) {
+            orConditions.push({ customerEmail: String(currentUser.email).toLowerCase() });
+          }
+          query.$or = orConditions;
+        }
+
+        const data = await appointmentsCollection.find(query).sort({ createdAt: -1 }).toArray();
+        return res.json({ success: true, data });
+      } catch (error) {
+        console.error('Error fetching appointments:', error);
+        return res.status(500).json({ success: false, message: 'Failed to fetch appointments' });
+      }
+    });
+
+    // Update appointment status (Customer: cancel own Pending; Admin: Confirm or Cancel)
+    app.patch('/appointments/:id/status', async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid appointment ID' });
+        }
+
+        const currentUser = await resolveRequestUser(req);
+        if (!currentUser) {
+          return res.status(401).json({ success: false, message: 'Unauthorized' });
+        }
+
+        const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(id) });
+        if (!appointment) {
+          return res.status(404).json({ success: false, message: 'Appointment not found' });
+        }
+
+        const rawStatus = String(req.body.status || '').trim().toLowerCase();
+        const targetStatus =
+          rawStatus === 'confirmed' ? 'Confirmed' : rawStatus === 'cancelled' ? 'Cancelled' : null;
+
+        if (!targetStatus) {
+          return res.status(400).json({ success: false, message: 'Status must be Confirmed or Cancelled' });
+        }
+
+        const role = String(currentUser.role || 'customer').toLowerCase();
+
+        if (role === 'admin') {
+          const updated = await appointmentsCollection.findOneAndUpdate(
+            { _id: new ObjectId(id) },
+            { $set: { status: targetStatus, updatedAt: new Date() } },
+            { returnDocument: 'after' },
+          );
+          return res.json({
+            success: true,
+            message: `Appointment ${targetStatus} successfully`,
+            data: updated?.value || updated,
+          });
+        }
+
+        const userIdStr = String(currentUser._id || currentUser.id || '');
+        const userEmailStr = String(currentUser.email || '').toLowerCase();
+        const isOwner =
+          (userIdStr && String(appointment.customerId) === userIdStr) ||
+          (userEmailStr && String(appointment.customerEmail || '').toLowerCase() === userEmailStr);
+
+        if (!isOwner) {
+          return res.status(403).json({
+            success: false,
+            message: 'Forbidden: You can only cancel your own appointments',
+          });
+        }
+        if (targetStatus !== 'Cancelled') {
+          return res.status(403).json({
+            success: false,
+            message: 'Customers can only cancel appointment requests',
+          });
+        }
+        if (String(appointment.status).toLowerCase() !== 'pending') {
+          return res.status(400).json({
+            success: false,
+            message: 'Only pending appointment requests can be cancelled',
+          });
+        }
+
+        const updated = await appointmentsCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          { $set: { status: 'Cancelled', updatedAt: new Date() } },
+          { returnDocument: 'after' },
+        );
+
+        return res.json({
+          success: true,
+          message: 'Appointment cancelled successfully',
+          data: updated?.value || updated,
+        });
+      } catch (error) {
+        console.error('Error updating appointment status:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update appointment status' });
+      }
+    });
+
     // Global & Multer error handler
     app.use((err, _req, res, _next) => {
       if (err instanceof multer.MulterError) {
         return res.status(400).json({ success: false, message: err.message });
       }
       if (err) {
-        return res
-          .status(400)
-          .json({ success: false, message: err.message || 'Bad request error' });
+        return res.status(400).json({ success: false, message: err.message || 'Bad request error' });
       }
       return res.status(500).json({ success: false, message: 'Internal server error' });
     });
